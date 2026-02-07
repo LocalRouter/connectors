@@ -1,0 +1,19 @@
+{
+  "name": "@localrouter/claude-code-mcp",
+  "version": "0.1.0",
+  "description": "MCP server wrapping Claude Code",
+  "license": "AGPL-3.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "lint": "tsc --noEmit"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
