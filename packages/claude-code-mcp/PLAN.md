@@ -249,17 +249,19 @@ Check the current status of a session and retrieve output.
 
 Respond to a pending question. Works identically for tool approvals, plan approvals, and user questions -- just pick the answer(s) from the provided options.
 
+Answers can include a reason after a colon (e.g. `"deny: too dangerous"`, `"reject: also cover the auth module"`). The part before the colon is matched against the options; the part after is passed as feedback to Claude.
+
 ```typescript
 {
   name: "claude_respond",
-  description: "Respond to a pending question in a Claude Code session. Provide one answer per question from the options shown in claude_status.",
+  description: "Respond to a pending question in a Claude Code session. Provide one answer per question, selected from the options shown in claude_status. Answers can include a reason after a colon (e.g. 'deny: too risky', 'reject: also cover auth').",
   inputSchema: {
     type: "object",
     properties: {
       sessionId: { type: "string", description: "The session ID" },
       id:        { type: "string", description: "The question ID from pendingQuestion.id in claude_status" },
       answers:   { type: "array", items: { type: "string" },
-                   description: "One answer per question, selected from the options (e.g. ['allow'], ['approve'], ['OAuth2', 'Yes'])" },
+                   description: "One answer per question. Use option value directly (e.g. 'allow') or with reason (e.g. 'deny: too dangerous')" },
     },
     required: ["sessionId", "id", "answers"]
   }
@@ -273,26 +275,43 @@ Respond to a pending question. Works identically for tool approvals, plan approv
 // Approve a tool
 claude_respond({ sessionId: "...", id: "tu_abc123", answers: ["allow"] })
 
-// Reject a plan
-claude_respond({ sessionId: "...", id: "tu_def456", answers: ["reject"] })
+// Deny a tool with reason
+claude_respond({ sessionId: "...", id: "tu_abc123", answers: ["deny: this command is too destructive"] })
+
+// Approve a plan
+claude_respond({ sessionId: "...", id: "tu_def456", answers: ["approve"] })
+
+// Reject a plan with feedback
+claude_respond({ sessionId: "...", id: "tu_def456", answers: ["reject: also consider the session management module and add more tests"] })
 
 // Answer multiple questions
 claude_respond({ sessionId: "...", id: "tu_ghi789", answers: ["OAuth2", "Yes"] })
 ```
 
+**Answer parsing:** Each answer is split on the first `:` to extract the decision and optional reason:
+```typescript
+function parseAnswer(answer: string): { decision: string; reason?: string } {
+  const colonIndex = answer.indexOf(":");
+  if (colonIndex === -1) return { decision: answer.trim() };
+  return {
+    decision: answer.slice(0, colonIndex).trim(),
+    reason: answer.slice(colonIndex + 1).trim(),
+  };
+}
+```
+
 **Internal translation** (invisible to the client):
 
-Our permission manager translates answers back to the `--permission-prompt-tool` response format based on the tool name:
+Our permission manager translates parsed answers back to the `--permission-prompt-tool` response format:
 
 | Tool Name | Answer | Permission Response |
 |---|---|---|
-| Any tool (Edit, Bash, etc.) | `["allow"]` | `{ behavior: "allow" }` |
-| Any tool | `["deny"]` | `{ behavior: "deny" }` |
-| `ExitPlanMode` | `["approve"]` | `{ behavior: "allow", updatedInput: <original> }` |
-| `ExitPlanMode` | `["reject"]` | `{ behavior: "deny" }` |
+| Any tool (Edit, Bash, etc.) | `"allow"` | `{ behavior: "allow" }` |
+| Any tool | `"deny"` | `{ behavior: "deny" }` |
+| Any tool | `"deny: too dangerous"` | `{ behavior: "deny", message: "too dangerous" }` |
+| `ExitPlanMode` | `"approve"` | `{ behavior: "allow", updatedInput: <original> }` |
+| `ExitPlanMode` | `"reject: cover auth too"` | `{ behavior: "deny", message: "cover auth too" }` |
 | `AskUserQuestion` | `["OAuth2", "Yes"]` | `{ behavior: "allow", updatedInput: { questions: <orig>, answers: ["OAuth2", "Yes"] } }` |
-
-If the user rejects a plan and wants to provide feedback on what to change, they can send a follow-up message via `claude_say` after the rejection.
 
 ### 5. `claude_interrupt`
 
@@ -389,10 +408,8 @@ Claude Code's plan mode (`--permission-mode plan`) restricts Claude to read-only
 4a. claude_respond({ sessionId: "abc", id: "tu_xyz", answers: ["approve"] })
     → Claude exits plan mode, begins implementation
 
-4b. claude_respond({ sessionId: "abc", id: "tu_xyz", answers: ["reject"] })
-    → Claude knows plan was rejected
-    claude_say({ sessionId: "abc", message: "Also cover the session management module" })
-    → Claude revises the plan with the new feedback
+4b. claude_respond({ sessionId: "abc", id: "tu_xyz", answers: ["reject: also cover the session management module"] })
+    → Claude receives the rejection with feedback, revises the plan
 ```
 
 ### Switching Modes Mid-Session
@@ -793,14 +810,23 @@ function translateAnswer(
   answers: string[],
   originalInput: Record<string, unknown>
 ): PermissionResponse {
+  const parsed = answers.map(parseAnswer);
+
   switch (type) {
-    case "tool_approval":
-      return { behavior: answers[0] === "allow" ? "allow" : "deny" };
-    case "plan_approval":
-      return answers[0] === "approve"
+    case "tool_approval": {
+      const { decision, reason } = parsed[0];
+      return decision === "allow"
+        ? { behavior: "allow" }
+        : { behavior: "deny", message: reason };
+    }
+    case "plan_approval": {
+      const { decision, reason } = parsed[0];
+      return decision === "approve"
         ? { behavior: "allow", updatedInput: originalInput }
-        : { behavior: "deny" };
+        : { behavior: "deny", message: reason };
+    }
     case "question":
+      // For questions, pass the raw answer strings (no parsing)
       return {
         behavior: "allow",
         updatedInput: {
