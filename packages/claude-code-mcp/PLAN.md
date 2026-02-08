@@ -1065,3 +1065,57 @@ The MCP server itself is configured by the MCP client that launches it. Example 
 - **Tool filtering UI**: Let MCP clients configure allowed/denied tools through a resource or prompt.
 - **Multiple working directories**: Support sessions that span multiple project directories.
 - **Session forking**: Use `--fork-session` to branch sessions for experimentation.
+
+---
+
+## Appendix: Lessons from Existing CLI Wrappers
+
+Analysis of two existing Claude Code wrapper projects informed several design decisions.
+
+### From `RichardAtCT/claude-code-openai-wrapper` (Python, Agent SDK)
+
+This project wraps Claude Code behind an OpenAI-compatible REST API using the Python Agent SDK (not CLI subprocess). Despite the different approach, several lessons apply directly:
+
+1. **`permissionMode: "bypassPermissions"` is essential for headless operation.** Without it, the SDK/CLI tries to interactively prompt for approval, which hangs in a server context. This was their biggest bug -- tools appeared "enabled" but never executed because the SDK was silently waiting for interactive approval. Our `--permission-prompt-tool` approach solves this differently (we route approvals programmatically rather than bypassing them), but we must ensure Claude Code never falls back to interactive prompting.
+
+2. **SDK/CLI message format instability across versions.** Their code is littered with dual-format handling (`hasattr(block, "text")` vs `isinstance(block, dict)`) because the Agent SDK changed its return types between versions. Our stream-json parser should be defensive about message shapes and handle unknown event types gracefully rather than crashing.
+
+3. **System prompt must be structured.** The SDK requires `{"type": "text", "text": "..."}` (or `{"type": "preset", "preset": "claude_code"}`), not plain strings. Verify whether the CLI's `--append-system-prompt` flag handles this automatically or if we need structured formatting.
+
+4. **Working directory isolation is critical.** Without an explicit working directory, Claude Code operates in the server's own directory and could read/modify the MCP server's source code. Every session must have an explicit `cwd` set.
+
+5. **`max_turns=1` when tools are disabled prevents wasted loops.** If a session is configured without tools, setting `--max-turns 1` avoids multi-turn reasoning loops where Claude tries to use tools that don't exist.
+
+6. **Session management can be in-memory with TTL.** Their sessions use a 1-hour TTL with a background cleanup task every 5 minutes. Since Claude Code persists sessions to disk (`.claude/`), our in-memory session tracking can be lightweight -- we just need enough state to manage the process lifecycle. If a session expires from our tracker, the client can always resume it via `claude_resume_session` with the session ID.
+
+7. **Token/cost estimation is approximate.** The SDK doesn't always provide exact token counts. When not available, they use a rough `len(text) / 4` heuristic. We should extract `cost_usd` from the `result` event when available but not depend on it.
+
+8. **Factory pattern for mock/real implementations aids testing.** When `node-pty` is not available (e.g., in CI), they fall back to a mock implementation. We should use dependency injection for the process manager to enable the same pattern with our mock CLI.
+
+### From `jasonpaulso/claude-cli-lib` (TypeScript, node-pty)
+
+This project is a generic PTY-based CLI process spawner. While it lacks Claude Code-specific features, it provides important anti-patterns and validation of our design choices:
+
+1. **PTY is the wrong tool for structured JSON communication.** Their use of `node-pty` means stdout and stderr are merged into a single stream, there's no way to write to stdin separately, and all output contains raw ANSI escape codes. Our decision to use `child_process.spawn` with piped stdio is validated -- structured NDJSON is fundamentally incompatible with PTY.
+
+2. **No stdin writing = no interactivity.** Their library has literally no method to write to the spawned process's stdin. This means no follow-up messages, no permission responses, no structured input. This is the direct consequence of using PTY without building a terminal emulator. Our `--input-format stream-json` approach avoids this entirely.
+
+3. **Process lifecycle cleanup in `finally` blocks.** Their pattern of cleaning up PTY handles in `finally` blocks is correct. We should do the same for our child processes -- ensure stdin is closed, output handlers are removed, and process references are cleared regardless of how the process ends.
+
+4. **Ring buffer for output storage.** Their `OutputStreamer` uses an array with a configurable max size and FIFO eviction, which matches our `EventBuffer` design. A max size of 500-1000 entries is reasonable.
+
+5. **The `CommandSanitizer` concept is useful but applies differently.** Their sanitizer blocks shell metacharacters, path traversal, and API key exposure in command arguments. For our MCP server, sanitization happens at a different level -- the MCP client sends prompts and tool parameters, and we validate those before passing them to Claude Code. We should still validate that prompts don't contain injection attempts and that working directories are within allowed paths.
+
+6. **Kill sends SIGHUP, not SIGINT.** PTY's `kill()` sends SIGHUP by default, which is different from SIGINT. With `child_process.spawn`, we have explicit control and should use `SIGINT` for graceful interrupt (equivalent to Escape) and `SIGTERM`/`SIGKILL` for forced termination.
+
+### Summary of Design Validations
+
+| Decision | Validated By |
+|---|---|
+| Use `child_process.spawn`, not `node-pty` | `claude-cli-lib` shows PTY limitations (no stdin, merged streams) |
+| Use `--permission-prompt-tool`, not `bypassPermissions` | `openai-wrapper` shows bypass works but loses all safety |
+| Defensive stream parsing with graceful error handling | `openai-wrapper` encountered SDK format changes between versions |
+| In-memory sessions with TTL cleanup | `openai-wrapper` uses same pattern successfully |
+| Explicit working directory per session | `openai-wrapper` learned this the hard way (security issue) |
+| Ring buffer for event storage | Both projects use bounded output buffers |
+| Factory/DI pattern for testability | `claude-cli-lib` uses factory for mock/real implementations |
