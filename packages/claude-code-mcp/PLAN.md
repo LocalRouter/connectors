@@ -42,9 +42,9 @@ An MCP (Model Context Protocol) server that wraps the Claude Code CLI, exposing 
           │   │  │  claude -p                                   │
           │   │  │    --output-format stream-json               │
           │   │  │    --input-format stream-json                │
+          │   │  │    --verbose --include-partial-messages      │
           │   │  │    --permission-prompt-tool mcp__perm__check │
           │   │  │    --mcp-config <generated-config>           │
-          │   │  │    --verbose                                 │
           │   │  │                                              │
           │   │  │  stdin  ◄── NDJSON messages (prompts,        │
           │   │  │             control responses)               │
@@ -58,6 +58,7 @@ An MCP (Model Context Protocol) server that wraps the Claude Code CLI, exposing 
           │   │  ┌─────────────────────────────────────────────┐
           │   │  │  Permission Handler MCP Server (internal)    │
           │   │  │  - Receives permission requests from Claude  │
+          │   │  │  - Also handles ExitPlanMode & AskUserQuestion│
           │   │  │  - HTTP POSTs to callback server             │
           │   │  │  - Blocks until response                     │
           │   │  └─────────────────────────────────────────────┘
@@ -75,13 +76,19 @@ An MCP (Model Context Protocol) server that wraps the Claude Code CLI, exposing 
 
 2. **Bidirectional streaming JSON**: A single long-lived Claude Code process per session, using NDJSON over stdin/stdout. This avoids the overhead of spawning a new process per message and naturally supports multi-turn conversations.
 
-3. **`--permission-prompt-tool` via internal MCP server**: Claude Code delegates permission checks to an MCP tool. We run a small internal MCP server (spawned by Claude Code via `--mcp-config`) that forwards permission requests back to our main process via HTTP on localhost. This gives us full control over the approval flow.
+3. **`--permission-prompt-tool` via internal MCP server**: Claude Code delegates permission checks to an MCP tool. We run a small internal MCP server (spawned by Claude Code via `--mcp-config`) that forwards permission requests back to our main process via HTTP on localhost. This gives us full control over the approval flow. This same mechanism handles `ExitPlanMode` and `AskUserQuestion` in plan mode.
 
-4. **MCP Elicitation with fallback**: When the MCP client supports elicitation, permission requests are forwarded directly to the human. When it doesn't, requests are queued and exposed via `approve_tool`/`deny_tool` tools.
+4. **MCP Elicitation with fallback**: When the MCP client supports elicitation, permission requests are forwarded directly to the human. When it doesn't, requests are queued and exposed via the `claude_respond` tool.
+
+5. **CLI defaults respected**: Optional parameters like `model`, `maxTurns`, `maxBudgetUsd` are not set unless explicitly provided -- Claude Code CLI's own configuration (from `settings.json`, environment, etc.) takes precedence.
+
+6. **No session storage of our own**: Session persistence is Claude Code's responsibility (`~/.claude/`). Our MCP server only tracks in-memory state for active process handles. `claude_list_sessions` reads directly from `~/.claude/history.jsonl`. Any session (including user-created interactive sessions) can be resumed.
 
 ---
 
 ## MCP Tools
+
+Six tools total. Tools use CLI defaults for all optional parameters -- if not specified, Claude Code's own configuration applies.
 
 ### 1. `claude_create_session`
 
@@ -95,12 +102,21 @@ Start a new Claude Code session with an initial prompt.
     type: "object",
     properties: {
       prompt:           { type: "string", description: "The initial task/prompt for Claude Code" },
-      workingDirectory: { type: "string", description: "Working directory for the session (default: server CWD)" },
-      model:            { type: "string", description: "Model to use (e.g. 'sonnet', 'opus')" },
-      allowedTools:     { type: "array", items: { type: "string" }, description: "Tools to pre-approve (e.g. ['Read', 'Glob'])" },
-      maxTurns:         { type: "number", description: "Maximum agentic turns before stopping" },
-      maxBudgetUsd:     { type: "number", description: "Maximum spend in USD" },
-      systemPrompt:     { type: "string", description: "Custom system prompt to append" },
+      workingDirectory: { type: "string", description: "Working directory for the session" },
+
+      // All optional -- CLI defaults apply when omitted
+      model:            { type: "string", description: "Model override (e.g. 'sonnet', 'opus', or full model ID)" },
+      permissionMode:   { type: "string", enum: ["default", "acceptEdits", "plan", "bypassPermissions"],
+                          description: "Permission mode. 'plan' starts in planning mode (read-only analysis, then ExitPlanMode). Default: CLI's configured mode" },
+      allowedTools:     { type: "array", items: { type: "string" },
+                          description: "Tools to pre-approve without prompting (e.g. ['Read', 'Glob', 'Bash(git diff *)'])" },
+      disallowedTools:  { type: "array", items: { type: "string" },
+                          description: "Tools to explicitly block" },
+      maxTurns:         { type: "number", description: "Maximum agentic turns. Default: unlimited" },
+      maxBudgetUsd:     { type: "number", description: "Maximum spend in USD. Default: unlimited" },
+      systemPrompt:     { type: "string", description: "System prompt text to append via --append-system-prompt" },
+      dangerouslySkipPermissions: { type: "boolean",
+                          description: "Skip all permission checks. Requires acknowledgment of risks. Default: false" },
     },
     required: ["prompt"]
   }
@@ -110,25 +126,27 @@ Start a new Claude Code session with an initial prompt.
 **Returns:** `{ sessionId: string, status: "running" }`
 
 **Behavior:**
-- Spawns a new `claude -p` process with streaming JSON flags
+- Spawns a new `claude -p` process with `--output-format stream-json --input-format stream-json --verbose --include-partial-messages`
 - Captures the `session_id` from the `init` event
 - Returns immediately (session runs asynchronously)
+- Only passes optional flags when explicitly provided; omitted = use CLI defaults
+- When `permissionMode: "plan"`, Claude enters read-only analysis mode and produces a plan via `ExitPlanMode`
 
-### 2. `claude_resume_session`
+### 2. `claude_send_message`
 
-Resume a previously created session with a new prompt.
+Send a message to an existing session. Handles both active sessions (process alive) and inactive sessions (auto-resumes).
 
 ```typescript
 {
-  name: "claude_resume_session",
-  description: "Resume an existing Claude Code session with a follow-up prompt",
+  name: "claude_send_message",
+  description: "Send a message to a Claude Code session. Automatically resumes the session if it has ended.",
   inputSchema: {
     type: "object",
     properties: {
-      sessionId: { type: "string", description: "The session ID to resume" },
-      prompt:    { type: "string", description: "The follow-up prompt/task" },
+      sessionId: { type: "string", description: "The session ID" },
+      message:   { type: "string", description: "The message to send" },
     },
-    required: ["sessionId", "prompt"]
+    required: ["sessionId", "message"]
   }
 }
 ```
@@ -136,9 +154,10 @@ Resume a previously created session with a new prompt.
 **Returns:** `{ sessionId: string, status: "running" }`
 
 **Behavior:**
-- If the session's process has exited, spawns a new process with `--resume <sessionId>`
-- If the session's process is still alive, sends the message via stdin (stream-json input)
-- Validates the session ID exists
+- If process is alive: writes a user message to stdin in stream-json format
+- If process has exited (completed, interrupted, error): spawns a new process with `--resume <sessionId>` and the message as prompt, preserving the original session config (model, permission mode, etc.)
+- If the session ID is unknown to our server (e.g., a user-created interactive session): creates a new tracked session and spawns with `--resume`
+- This single tool replaces separate "resume" and "send message" tools
 
 ### 3. `claude_get_status`
 
@@ -163,14 +182,15 @@ Check the current status of a session and retrieve output.
 ```typescript
 {
   sessionId: string,
-  status: "running" | "waiting_for_approval" | "completed" | "error" | "interrupted",
-  result?: string,              // Final result if completed
+  status: "running" | "waiting_for_input" | "completed" | "error" | "interrupted",
+  result?: string,              // Final result text if completed
   recentOutput: string[],       // Recent text output events
-  pendingApprovals: Array<{     // Pending permission requests
-    approvalId: string,
-    toolName: string,
-    toolInput: object,
-    description: string,
+  pendingInputs: Array<{        // Pending permission/plan/question requests
+    inputId: string,
+    type: "permission" | "plan_review" | "user_question",
+    toolName: string,           // e.g. "Edit", "Bash", "ExitPlanMode", "AskUserQuestion"
+    toolInput: object,          // The tool's input parameters
+    description: string,        // Human-readable summary
   }>,
   toolUseEvents: Array<{       // Tools that have been used
     toolName: string,
@@ -181,77 +201,51 @@ Check the current status of a session and retrieve output.
 }
 ```
 
-### 4. `claude_send_message`
+**Note on `pendingInputs`:** This unified list includes three types of requests that all flow through the `--permission-prompt-tool` mechanism:
+- **`permission`**: Standard tool approval (Edit, Bash, etc.)
+- **`plan_review`**: An `ExitPlanMode` call -- Claude has finished planning and is presenting the plan for review
+- **`user_question`**: An `AskUserQuestion` call -- Claude is asking for clarification (may include multiple-choice options)
 
-Send additional input to a running or completed session.
+### 4. `claude_respond`
+
+Respond to a pending permission request, plan review, or user question. Replaces separate approve/deny tools.
 
 ```typescript
 {
-  name: "claude_send_message",
-  description: "Send a follow-up message to an existing Claude Code session",
+  name: "claude_respond",
+  description: "Respond to a pending request in a Claude Code session (permission approval, plan review, or question answer)",
   inputSchema: {
     type: "object",
     properties: {
-      sessionId: { type: "string", description: "The session ID" },
-      message:   { type: "string", description: "The message to send" },
+      sessionId:     { type: "string", description: "The session ID" },
+      inputId:       { type: "string", description: "The pending input request ID (from get_status pendingInputs)" },
+      decision:      { type: "string", enum: ["allow", "deny"],
+                       description: "Whether to allow or deny the request" },
+      reason:        { type: "string", description: "Reason for the decision (shown to Claude on deny)" },
+      updatedInput:  { type: "object", description: "Modified tool input (e.g., sanitized command). Used with 'allow'." },
     },
-    required: ["sessionId", "message"]
+    required: ["sessionId", "inputId", "decision"]
   }
 }
 ```
 
-**Returns:** `{ sessionId: string, status: "running" }`
+**Returns:** `{ sessionId: string, status: "running" | "waiting_for_input" }`
 
-**Behavior:**
-- If process is alive: writes a user message to stdin in stream-json format
-- If process has exited: spawns a new process with `--resume` and the message as prompt
-- Essentially an alias for resume but with clearer semantics for ongoing conversations
+**Behavior for different request types:**
 
-### 5. `claude_approve`
+- **Permission request (`type: "permission"`):**
+  - `allow` → `{ behavior: "allow", updatedInput }` sent to Claude Code
+  - `deny` → `{ behavior: "deny", message: reason }` sent to Claude Code
 
-Approve a pending permission request.
+- **Plan review (`type: "plan_review"`, toolName: `"ExitPlanMode"`):**
+  - `allow` → approves the plan, Claude exits plan mode and begins execution
+  - `deny` → rejects with `reason` as feedback, Claude revises the plan
 
-```typescript
-{
-  name: "claude_approve",
-  description: "Approve a pending tool permission request in a Claude Code session",
-  inputSchema: {
-    type: "object",
-    properties: {
-      sessionId:  { type: "string", description: "The session ID" },
-      approvalId: { type: "string", description: "The approval request ID" },
-      modifiedInput: { type: "object", description: "Optional modified tool input (for sanitization)" },
-    },
-    required: ["sessionId", "approvalId"]
-  }
-}
-```
+- **User question (`type: "user_question"`, toolName: `"AskUserQuestion"`):**
+  - `allow` with `updatedInput` containing answers → Claude receives the answers
+  - `deny` → Claude proceeds without answers (best-effort)
 
-**Returns:** `{ sessionId: string, status: "running", approved: true }`
-
-### 6. `claude_deny`
-
-Deny a pending permission request.
-
-```typescript
-{
-  name: "claude_deny",
-  description: "Deny a pending tool permission request in a Claude Code session",
-  inputSchema: {
-    type: "object",
-    properties: {
-      sessionId:  { type: "string", description: "The session ID" },
-      approvalId: { type: "string", description: "The approval request ID" },
-      reason:     { type: "string", description: "Reason for denial (shown to Claude)" },
-    },
-    required: ["sessionId", "approvalId"]
-  }
-}
-```
-
-**Returns:** `{ sessionId: string, status: "running", denied: true }`
-
-### 7. `claude_interrupt`
+### 5. `claude_interrupt`
 
 Interrupt a running session (equivalent to pressing Escape in the CLI).
 
@@ -273,20 +267,23 @@ Interrupt a running session (equivalent to pressing Escape in the CLI).
 
 **Behavior:**
 - Sends `SIGINT` to the Claude Code process
-- Process should emit an interrupted/result event before exiting
-- Session can be resumed later with `claude_resume_session`
+- Process should emit a result event with `status: "interrupted"` before exiting
+- Session can be resumed later with `claude_send_message`
 
-### 8. `claude_list_sessions`
+### 6. `claude_list_sessions`
 
-List all sessions managed by this MCP server instance.
+List all Claude Code sessions from the global session history. Lists sessions from any directory, including user-created interactive sessions.
 
 ```typescript
 {
   name: "claude_list_sessions",
-  description: "List all Claude Code sessions managed by this server",
+  description: "List all Claude Code sessions across all projects. Includes both programmatic and interactive user-created sessions.",
   inputSchema: {
     type: "object",
-    properties: {},
+    properties: {
+      projectDirectory: { type: "string", description: "Filter sessions by project directory path. If omitted, lists all sessions." },
+      limit:            { type: "number", description: "Maximum number of sessions to return (default: 50, most recent first)" },
+    },
   }
 }
 ```
@@ -296,13 +293,74 @@ List all sessions managed by this MCP server instance.
 {
   sessions: Array<{
     sessionId: string,
-    status: "running" | "waiting_for_approval" | "completed" | "error" | "interrupted",
-    createdAt: string,      // ISO timestamp
-    workingDirectory: string,
-    pendingApprovals: number,
+    projectDirectory: string,  // Working directory where the session was created
+    displayText: string,       // Summary/topic of the conversation
+    timestamp: string,         // ISO timestamp
+    isActive: boolean,         // Whether this server currently has an active process for this session
+    activeStatus?: "running" | "waiting_for_input" | "completed" | "error" | "interrupted",
   }>
 }
 ```
+
+**Behavior:**
+- Reads `~/.claude/history.jsonl` and parses entries
+- Each line contains: `{ timestamp, project, display, session_id?, ... }`
+- Optionally filters by `projectDirectory`
+- Sorts by timestamp descending (most recent first)
+- Annotates entries with `isActive: true` if our server currently has an active process for that session
+- Any returned session can be resumed via `claude_send_message` with its `sessionId`, even if it was created interactively by the user
+
+---
+
+## Planning Mode Support
+
+Claude Code's plan mode (`--permission-mode plan`) restricts Claude to read-only tools and produces a plan via `ExitPlanMode`. This integrates naturally with our architecture because both `ExitPlanMode` and `AskUserQuestion` go through the `--permission-prompt-tool` mechanism.
+
+### How It Works
+
+1. Client creates a session with `permissionMode: "plan"`:
+   ```
+   claude_create_session({ prompt: "Analyze the auth module and propose a refactoring plan", permissionMode: "plan" })
+   ```
+
+2. Claude reads code, analyzes the codebase (using only read-only tools like Read, Grep, Glob).
+
+3. Claude may call `AskUserQuestion` for clarification. This arrives as a `pendingInput` with `type: "user_question"`. The `toolInput` contains a `questions` array:
+   ```json
+   {
+     "inputId": "q-123",
+     "type": "user_question",
+     "toolName": "AskUserQuestion",
+     "toolInput": {
+       "questions": [
+         { "question": "Which auth provider should I target?", "options": ["OAuth2", "SAML", "Both"] }
+       ]
+     }
+   }
+   ```
+   Client responds via `claude_respond`:
+   ```
+   claude_respond({ sessionId, inputId: "q-123", decision: "allow", updatedInput: { questions: [...], answers: ["OAuth2"] } })
+   ```
+
+4. Claude writes the plan and calls `ExitPlanMode`. This arrives as a `pendingInput` with `type: "plan_review"`:
+   ```json
+   {
+     "inputId": "plan-456",
+     "type": "plan_review",
+     "toolName": "ExitPlanMode",
+     "toolInput": { "plan": "..." },
+     "description": "Claude has completed a plan and is requesting approval to proceed with implementation"
+   }
+   ```
+
+5. Client reviews the plan (visible in `toolInput`) and responds:
+   - `claude_respond({ ..., decision: "allow" })` → Claude exits plan mode, switches to execution mode, implements the plan
+   - `claude_respond({ ..., decision: "deny", reason: "Also consider the session management module" })` → Claude revises the plan
+
+### Permission Mode Transitions
+
+When a plan is approved, Claude Code internally transitions from `plan` mode to `acceptEdits` (or whichever mode is appropriate for execution). Our MCP server doesn't need to manage this transition -- the CLI handles it.
 
 ---
 
@@ -312,7 +370,7 @@ List all sessions managed by this MCP server instance.
 
 Responsibilities:
 - Initialize the MCP server with STDIO transport
-- Register all 8 tools
+- Register all 6 tools
 - Detect client elicitation capability during initialization
 - Route tool calls to the session manager
 - Handle graceful shutdown
@@ -343,6 +401,8 @@ Responsibilities:
 - Map session IDs to process handles and state
 - Provide session state queries
 - Handle session reconnection (process died but session ID is valid)
+- Auto-resume on `send_message` to inactive sessions
+- List all global sessions by parsing `~/.claude/history.jsonl`
 
 ```typescript
 interface Session {
@@ -351,13 +411,13 @@ interface Session {
   process: ChildProcess | null;
   createdAt: Date;
   workingDirectory: string;
-  config: SessionConfig;
+  config: SessionConfig;       // Original config for re-spawning on resume
 
   // Event buffer (ring buffer of recent events)
   eventBuffer: StreamEvent[];
 
-  // Pending permission requests
-  pendingApprovals: Map<string, PendingApproval>;
+  // Pending inputs (permissions, plan reviews, questions)
+  pendingInputs: Map<string, PendingInput>;
 
   // Final result
   result?: string;
@@ -370,10 +430,19 @@ interface Session {
 
 type SessionStatus =
   | "running"
-  | "waiting_for_approval"
+  | "waiting_for_input"
   | "completed"
   | "error"
   | "interrupted";
+
+interface PendingInput {
+  inputId: string;
+  type: "permission" | "plan_review" | "user_question";
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  description: string;
+  resolve: (response: PermissionResponse) => void;  // Resolves the HTTP callback
+}
 ```
 
 ### Module 3: `process-manager.ts` -- Claude Code CLI Process
@@ -384,6 +453,7 @@ Responsibilities:
 - Send NDJSON messages via stdin
 - Handle process lifecycle (spawn, signal, exit)
 - Generate `--mcp-config` for the internal permission server
+- Always pass `--include-partial-messages` for streaming output
 
 ```typescript
 interface ProcessManager {
@@ -404,20 +474,26 @@ interface ManagedProcess {
 
   // Actions
   sendMessage(message: string, sessionId: string): void;
-  sendControlResponse(requestId: string, response: ControlResponse): void;
   interrupt(): void;
   kill(): void;
 }
 
 interface SpawnConfig {
   prompt: string;
-  workingDirectory: string;
+  workingDirectory?: string;
   resumeSessionId?: string;
+
+  // All optional -- only passed to CLI when explicitly set
   model?: string;
+  permissionMode?: string;
   allowedTools?: string[];
+  disallowedTools?: string[];
   maxTurns?: number;
   maxBudgetUsd?: number;
   systemPrompt?: string;
+  dangerouslySkipPermissions?: boolean;
+
+  // Internal
   permissionCallbackPort: number;
 }
 ```
@@ -426,8 +502,9 @@ interface SpawnConfig {
 
 Responsibilities:
 - Transform raw stdout bytes into parsed JSON objects
-- Type-discriminate events (init, stream_event, result, control_request, etc.)
+- Type-discriminate events (init, stream_event, result, etc.)
 - Handle malformed lines gracefully (log to stderr, skip)
+- Handle unknown event types defensively (don't crash)
 - Manage backpressure
 
 ```typescript
@@ -464,50 +541,43 @@ interface ResultEvent {
   turns?: number;
 }
 
-interface ControlRequest {
-  type: "control_request";
-  request_id: string;
-  request: {
-    subtype: "can_use_tool";
-    tool_name: string;
-    input: Record<string, unknown>;
-    tool_use_id: string;
-  };
+// Unknown events are captured but not parsed strictly
+interface UnknownEvent {
+  type: string;
+  [key: string]: unknown;
 }
 ```
 
-### Module 5: `permission-manager.ts` -- Permission Handling
+### Module 5: `permission-manager.ts` -- Permission & Input Handling
 
 Responsibilities:
-- Receive permission requests from the internal HTTP callback server
+- Receive requests from the internal HTTP callback server
+- Classify requests: permission, plan review (`ExitPlanMode`), or user question (`AskUserQuestion`)
 - Attempt MCP elicitation if client supports it
 - Fall back to queueing if elicitation unavailable
-- Resolve pending approvals when approve/deny tools are called
-- Timeout handling for stale permission requests
+- Resolve pending inputs when `claude_respond` is called
+- Timeout handling for stale requests
 
 ```typescript
 interface PermissionManager {
-  // Called when Claude Code requests permission
-  handlePermissionRequest(
+  // Called when Claude Code requests any tool approval
+  handleRequest(
     sessionId: string,
-    request: PermissionRequest
+    request: ToolApprovalRequest
   ): Promise<PermissionResponse>;
 
-  // Called when MCP client approves via tool
-  approve(sessionId: string, approvalId: string, modifiedInput?: object): void;
+  // Called when MCP client responds via claude_respond tool
+  respond(sessionId: string, inputId: string, decision: "allow" | "deny",
+          reason?: string, updatedInput?: object): void;
 
-  // Called when MCP client denies via tool
-  deny(sessionId: string, approvalId: string, reason?: string): void;
-
-  // Check for pending approvals
-  getPendingApprovals(sessionId: string): PendingApproval[];
+  // Check for pending inputs
+  getPendingInputs(sessionId: string): PendingInput[];
 }
 
-interface PermissionRequest {
-  approvalId: string;    // = tool_use_id
-  toolName: string;
+interface ToolApprovalRequest {
+  toolUseId: string;    // used as inputId
+  toolName: string;     // "Edit", "Bash", "ExitPlanMode", "AskUserQuestion", etc.
   toolInput: Record<string, unknown>;
-  description: string;   // Human-readable description
 }
 
 interface PermissionResponse {
@@ -523,7 +593,7 @@ Responsibilities:
 - Listen on a random localhost port
 - Receive HTTP POST requests from the internal permission handler MCP server
 - Forward to the permission manager
-- Block until the permission is resolved
+- Block until the input is resolved (by elicitation or by `claude_respond`)
 - Return the allow/deny response
 
 ```typescript
@@ -539,6 +609,8 @@ A standalone Node.js script that Claude Code spawns as an MCP server. It:
 2. When called, HTTP POSTs to the callback server (port passed via env var)
 3. Blocks until the HTTP response arrives
 4. Returns the allow/deny result to Claude Code
+
+This handles ALL types of tool approval requests uniformly: regular permissions, `ExitPlanMode`, and `AskUserQuestion`. The classification into `permission`/`plan_review`/`user_question` happens in our permission manager based on `tool_name`.
 
 This file is bundled with the package and referenced in the generated `--mcp-config`.
 
@@ -629,20 +701,60 @@ MCP Client                Our MCP Server              Claude Code CLI          P
     │                          │                            │                        │
     │  call get_status         │                            │                        │
     │─────────────────────────►│                            │                        │
-    │  { waiting_for_approval, │                            │                        │
-    │    pendingApprovals: [   │                            │                        │
-    │      { Edit src/auth.ts }│                            │                        │
+    │  { waiting_for_input,    │                            │                        │
+    │    pendingInputs: [      │                            │                        │
+    │      { type: permission, │                            │                        │
+    │        Edit src/auth.ts }│                            │                        │
     │    ] }                   │                            │                        │
     │◄─────────────────────────│                            │                        │
     │                          │                            │                        │
-    │  call approve(id)        │                            │                        │
+    │  call claude_respond     │                            │                        │
+    │  { decision: "allow" }   │                            │                        │
     │─────────────────────────►│                            │                        │
     │                          │  HTTP 200 { allow }        │                        │
     │                          │───────────────────────────────────────────────────►│
     │                          │                            │◄─────────────────────│
     │                          │                            │  { allow }            │
-    │  { approved: true }      │                            │                        │
+    │  { status: "running" }   │                            │                        │
     │◄─────────────────────────│                            │                        │
+```
+
+### Flow C: Plan Mode (ExitPlanMode)
+
+```
+MCP Client                Our MCP Server              Claude Code CLI          Perm Handler MCP
+    │                          │                            │                        │
+    │  create_session          │                            │                        │
+    │  permissionMode: "plan"  │                            │                        │
+    │─────────────────────────►│  spawn claude -p           │                        │
+    │                          │  --permission-mode plan    │                        │
+    │                          │───────────────────────────►│                        │
+    │                          │                            │                        │
+    │                          │                            │ reads code, analyzes   │
+    │                          │                            │ writes plan            │
+    │                          │                            │                        │
+    │                          │                            │ calls ExitPlanMode     │
+    │                          │                            │──────────────────────►│
+    │                          │  HTTP POST /permission     │                        │
+    │                          │  tool_name: ExitPlanMode   │                        │
+    │                          │◄───────────────────────────────────────────────────│
+    │                          │                            │                        │
+    │  get_status              │                            │                        │
+    │─────────────────────────►│                            │                        │
+    │  { pendingInputs: [      │                            │                        │
+    │    { type: plan_review,  │                            │                        │
+    │      toolInput: {plan}}  │                            │                        │
+    │  ]}                      │                            │                        │
+    │◄─────────────────────────│                            │                        │
+    │                          │                            │                        │
+    │  claude_respond          │                            │                        │
+    │  { decision: "allow" }   │                            │                        │
+    │─────────────────────────►│  HTTP 200 { allow }        │                        │
+    │                          │───────────────────────────────────────────────────►│
+    │                          │                            │◄─────────────────────│
+    │                          │                            │                        │
+    │                          │                            │ exits plan mode        │
+    │                          │                            │ begins implementation  │
 ```
 
 ---
@@ -659,45 +771,48 @@ MCP Client                Our MCP Server              Claude Code CLI          P
         ┌──────────│  RUNNING  │◄─────────────────────┐
         │          └─────┬─────┘                       │
         │                │                             │
-        │    permission  │           approve/deny      │
-        │    request     │                             │
+        │    tool needs  │          claude_respond      │
+        │    approval    │                             │
         │                ▼                             │
         │   ┌────────────────────────┐                 │
-        │   │  WAITING_FOR_APPROVAL  │─────────────────┘
+        │   │  WAITING_FOR_INPUT     │─────────────────┘
+        │   │  (permission, plan     │
+        │   │   review, or question) │
         │   └────────────────────────┘
         │
         │  interrupt
         │  (SIGINT)
-        │                ┌──────────────┐   resume_session
+        │                ┌──────────────┐   send_message
         ├───────────────►│  INTERRUPTED  │──────────────────►  RUNNING
-        │                └──────────────┘
+        │                └──────────────┘   (auto-resume)
         │
         │  process exits
         │  successfully
-        │                ┌──────────────┐   resume_session
+        │                ┌──────────────┐   send_message
         ├───────────────►│  COMPLETED    │──────────────────►  RUNNING
-        │                └──────────────┘
+        │                └──────────────┘   (auto-resume)
         │
         │  process crashes
         │  or error
-        │                ┌──────────────┐   resume_session
+        │                ┌──────────────┐   send_message
         └───────────────►│  ERROR        │──────────────────►  RUNNING
-                         └──────────────┘
+                         └──────────────┘   (auto-resume)
 ```
 
-Any terminal state (INTERRUPTED, COMPLETED, ERROR) can transition back to RUNNING via `resume_session` or `send_message`, which spawns a new process with `--resume`.
+Any terminal state (INTERRUPTED, COMPLETED, ERROR) can transition back to RUNNING via `claude_send_message`, which automatically spawns a new process with `--resume`.
 
-### Session Reconnection
+### Session Discovery & Reconnection
 
-When the MCP server restarts (e.g., client reconnects), it starts with no active sessions. However, if a client provides a session ID from a previous run, we can resume it:
+Our MCP server does NOT maintain its own session index. Instead:
 
-1. Client calls `claude_resume_session` with an old session ID
-2. We create a new Session object with that ID
-3. Spawn `claude -p --resume <sessionId> --output-format stream-json ...`
-4. Claude Code loads the session history from its own persistence (`.claude/` directory)
-5. The session is now live again
+1. **`claude_list_sessions`** reads `~/.claude/history.jsonl` directly. This file is maintained by Claude Code itself and contains all sessions from all directories, whether created interactively or programmatically.
 
-This works because Claude Code's `--resume` loads the full conversation history from disk. Our MCP server doesn't need to persist anything -- Claude Code handles it.
+2. **Any session can be resumed** via `claude_send_message(sessionId, message)`. If we don't have an active process for that session, we spawn `claude -p --resume <sessionId>`. This works for:
+   - Sessions we created earlier in this server lifetime
+   - Sessions from a previous server lifetime
+   - Interactive sessions the user created in the terminal
+
+3. **Server restart** loses only the in-memory process handles. All session data survives in Claude Code's own persistence. Clients just need to call `claude_send_message` with the session ID.
 
 ---
 
@@ -711,45 +826,59 @@ const args = [
   "--output-format", "stream-json",
   "--input-format", "stream-json",
   "--verbose",
+  "--include-partial-messages",
 ];
 
 if (config.resumeSessionId) {
   args.push("--resume", config.resumeSessionId);
 }
-if (config.model) {
+
+// Only pass optional flags when explicitly set (otherwise CLI defaults apply)
+if (config.model !== undefined) {
   args.push("--model", config.model);
+}
+if (config.permissionMode !== undefined) {
+  args.push("--permission-mode", config.permissionMode);
 }
 if (config.allowedTools?.length) {
   args.push("--allowedTools", ...config.allowedTools);
 }
-if (config.maxTurns) {
+if (config.disallowedTools?.length) {
+  args.push("--disallowedTools", ...config.disallowedTools);
+}
+if (config.maxTurns !== undefined) {
   args.push("--max-turns", String(config.maxTurns));
 }
-if (config.maxBudgetUsd) {
+if (config.maxBudgetUsd !== undefined) {
   args.push("--max-budget-usd", String(config.maxBudgetUsd));
 }
-if (config.systemPrompt) {
+if (config.systemPrompt !== undefined) {
   args.push("--append-system-prompt", config.systemPrompt);
 }
+if (config.dangerouslySkipPermissions) {
+  args.push("--dangerously-skip-permissions");
+}
 
-// Permission handling
-const mcpConfig = {
-  mcpServers: {
-    perm: {
-      command: "node",
-      args: [permissionHandlerScriptPath],
-      env: {
-        PERMISSION_CALLBACK_PORT: String(config.permissionCallbackPort),
-        PERMISSION_SESSION_ID: sessionId,
+// Permission handling via internal MCP server (unless bypassed)
+if (!config.dangerouslySkipPermissions) {
+  const mcpConfig = {
+    mcpServers: {
+      perm: {
+        command: "node",
+        args: [permissionHandlerScriptPath],
+        env: {
+          PERMISSION_CALLBACK_PORT: String(config.permissionCallbackPort),
+          PERMISSION_SESSION_ID: sessionId,
+        },
       },
     },
-  },
-};
-args.push("--mcp-config", JSON.stringify(mcpConfig));
-args.push("--permission-prompt-tool", "mcp__perm__permission_check");
+  };
+  args.push("--mcp-config", JSON.stringify(mcpConfig));
+  args.push("--permission-prompt-tool", "mcp__perm__permission_check");
+}
 
-const child = spawn("claude", args, {
-  cwd: config.workingDirectory,
+const child = spawn(cliPath, args, {
+  cwd: config.workingDirectory || process.cwd(),
   stdio: ["pipe", "pipe", "pipe"],
   env: { ...process.env },
 });
@@ -839,7 +968,7 @@ packages/claude-code-mcp/
 │   ├── session-manager.ts               # Session lifecycle management
 │   ├── process-manager.ts               # Claude Code CLI process spawning/management
 │   ├── stream-parser.ts                 # NDJSON stream parsing, event typing
-│   ├── permission-manager.ts            # Permission handling (elicitation + queue)
+│   ├── permission-manager.ts            # Permission/input handling (elicitation + queue)
 │   ├── permission-callback-server.ts    # Internal HTTP server for permission callbacks
 │   ├── permission-handler-mcp.ts        # Standalone MCP server script for Claude Code
 │   └── types.ts                         # Shared type definitions
@@ -882,18 +1011,20 @@ packages/claude-code-mcp/
 A standalone Node.js script that simulates Claude Code's stream-json behavior. This is the foundation for all non-E2E tests.
 
 **Capabilities:**
-- Accepts the same flags as real Claude Code (`-p`, `--output-format`, `--input-format`, `--resume`, etc.)
+- Accepts the same flags as real Claude Code (`-p`, `--output-format`, `--input-format`, `--resume`, `--permission-mode`, etc.)
 - Emits `init` event with a session ID
-- Emits `stream_event` events with configurable text content
+- Emits `stream_event` events with configurable text content (including partial messages)
 - Emits `result` event on completion
-- Supports permission requests (emits control_request or calls permission-prompt-tool)
+- Supports permission requests (calls permission-prompt-tool MCP server)
+- Supports plan mode (emits ExitPlanMode request)
+- Supports AskUserQuestion
 - Responds to SIGINT by emitting interrupted result
 - Can simulate delays, errors, and multi-turn conversations
 - Behavior controlled via environment variables or a config file
 
 ```typescript
 // Example: mock-claude-cli.ts
-// MOCK_BEHAVIOR=success|error|permission_request|slow|hang
+// MOCK_BEHAVIOR=success|error|permission_request|plan_mode|ask_question|slow|hang
 // MOCK_RESULT="The task is complete"
 // MOCK_PERMISSION_TOOL="Bash"
 
@@ -908,37 +1039,46 @@ A standalone Node.js script that simulates Claude Code's stream-json behavior. T
 - Handles partial lines (buffering)
 - Handles backpressure
 - Correctly discriminates event types (init, stream_event, result)
+- Handles unknown event types without crashing
 
 **`session-manager.test.ts`**
 - Creates sessions with correct initial state
-- State transitions (running → waiting_for_approval → running → completed)
+- State transitions (running → waiting_for_input → running → completed)
 - Tracks multiple concurrent sessions
-- Handles session not found errors
+- Handles session not found -- creates on-the-fly for unknown IDs (for resuming user sessions)
 - Cleans up sessions on process exit
-- Resume creates new process with correct flags
+- send_message auto-resumes with correct flags
+- Lists sessions by parsing history.jsonl
 
 **`permission-manager.test.ts`**
-- Queues permission requests when elicitation unavailable
-- Resolves pending approvals on approve/deny
+- Queues requests when elicitation unavailable
+- Resolves pending inputs on `claude_respond`
+- Classifies tool requests: permission vs plan_review vs user_question
 - Attempts elicitation when client supports it
-- Times out stale permission requests
-- Handles concurrent permission requests for same session
+- Times out stale requests
+- Handles concurrent requests for same session
+- Plan review flow (ExitPlanMode allow/deny)
+- AskUserQuestion flow (answers in updatedInput)
 
 ### 3. Integration Tests
 
 **`process-manager.test.ts`**
 - Spawns mock CLI, captures init event and session ID
 - Sends messages via stdin, receives responses
+- Streams partial messages via --include-partial-messages
 - Interrupt via SIGINT produces interrupted status
 - Handles process crash (non-zero exit)
 - Handles process hang (timeout)
 - Permission flow via internal HTTP callback
+- Plan mode flow via ExitPlanMode
+- Verifies only explicitly-set flags are passed to CLI
 
 **`mcp-server.test.ts`**
 - Tests each tool handler with mock session manager
 - Validates input schema enforcement
 - Tests error responses for invalid session IDs
 - Tests elicitation flow with mock MCP client
+- Tests plan mode end-to-end through MCP tools
 
 ### 4. End-to-End Tests (`e2e.test.ts`)
 
@@ -946,9 +1086,10 @@ Gated behind `CLAUDE_CODE_E2E=true` environment variable. Requires real Claude C
 
 - Creates a real session with a simple prompt
 - Checks status until completion
-- Resumes a completed session
+- Sends a follow-up message (auto-resumes completed session)
 - Interrupts a running session
 - Permission approval flow
+- Lists sessions and verifies created session appears
 
 ### 5. Test Infrastructure
 
@@ -978,20 +1119,23 @@ Gated behind `CLAUDE_CODE_E2E=true` environment variable. Requires real Claude C
 - [ ] Implement `process-manager.ts` (spawn, parse events, send messages, signal)
 - [ ] Write `process-manager.test.ts` using mock CLI
 - [ ] Verify bidirectional stream-json communication works
+- [ ] Verify `--include-partial-messages` streaming
 
 ### Phase 3: Session Management
 - [ ] Implement `session-manager.ts` (lifecycle, state machine, event buffer)
+- [ ] Implement `claude_list_sessions` (parse `~/.claude/history.jsonl`)
 - [ ] Write `session-manager.test.ts`
-- [ ] Implement session resume logic
+- [ ] Implement auto-resume logic in send_message
 
-### Phase 4: Permission Handling
+### Phase 4: Permission & Input Handling
 - [ ] Implement `permission-callback-server.ts` (internal HTTP server)
 - [ ] Implement `permission-handler-mcp.ts` (standalone script)
-- [ ] Implement `permission-manager.ts` (elicitation + queue)
+- [ ] Implement `permission-manager.ts` (elicitation + queue + request classification)
+- [ ] Handle ExitPlanMode and AskUserQuestion as input types
 - [ ] Write `permission-manager.test.ts`
 
 ### Phase 5: MCP Server & Tools
-- [ ] Implement `mcp-server.ts` with all 8 tools
+- [ ] Implement `mcp-server.ts` with all 6 tools
 - [ ] Implement `index.ts` entry point
 - [ ] Write `mcp-server.test.ts`
 - [ ] Test elicitation detection and flow
@@ -1017,7 +1161,6 @@ The MCP server itself is configured by the MCP client that launches it. Example 
       "args": ["./node_modules/@localrouter/claude-code-mcp/dist/index.js"],
       "env": {
         "CLAUDE_CODE_PATH": "/usr/local/bin/claude",
-        "DEFAULT_WORKING_DIR": "/home/user/projects",
         "PERMISSION_TIMEOUT_MS": "300000",
         "MAX_SESSIONS": "10",
         "LOG_LEVEL": "info"
@@ -1032,9 +1175,8 @@ The MCP server itself is configured by the MCP client that launches it. Example 
 | Variable | Default | Description |
 |---|---|---|
 | `CLAUDE_CODE_PATH` | `"claude"` | Path to the Claude Code CLI binary |
-| `DEFAULT_WORKING_DIR` | `process.cwd()` | Default working directory for new sessions |
-| `PERMISSION_TIMEOUT_MS` | `300000` (5 min) | Timeout for pending permission requests |
-| `MAX_SESSIONS` | `10` | Maximum concurrent sessions |
+| `PERMISSION_TIMEOUT_MS` | `300000` (5 min) | Timeout for pending permission/input requests |
+| `MAX_SESSIONS` | `10` | Maximum concurrent active sessions (processes) |
 | `LOG_LEVEL` | `"info"` | Logging level (debug, info, warn, error) |
 | `EVENT_BUFFER_SIZE` | `500` | Number of events to retain per session |
 
@@ -1050,6 +1192,10 @@ The MCP server itself is configured by the MCP client that launches it. Example 
 
 3. **SIGINT behavior on Windows**: `subprocess.kill('SIGINT')` on Windows causes immediate forceful termination. May need IPC-based interrupt signaling for Windows support.
 
+4. **`history.jsonl` format stability**: We parse `~/.claude/history.jsonl` to list sessions. This file's format is not officially documented as a public API and could change between CLI versions. We should parse defensively and handle missing fields gracefully.
+
+5. **`ExitPlanMode` via `--permission-prompt-tool`**: Need to verify that `ExitPlanMode` actually routes through the permission-prompt-tool mechanism in non-interactive mode. The docs indicate it goes through `canUseTool` in the SDK, but the CLI behavior may differ.
+
 ### Design Alternatives Considered
 
 1. **Agent SDK instead of CLI**: Using `@anthropic-ai/claude-agent-sdk` directly would give cleaner hooks and streaming, but the user specifically requested CLI wrapping, and the CLI approach keeps the MCP server independent of API key management.
@@ -1058,13 +1204,16 @@ The MCP server itself is configured by the MCP client that launches it. Example 
 
 3. **Inline `control_request`/`control_response`**: Using `--permission-prompt-tool stdio` for inline permission handling through the same stdin/stdout channel was considered. While simpler (no HTTP server needed), it has known reliability issues and mixes permission protocol with the streaming output protocol.
 
+4. **Separate approve/deny tools**: Rejected in favor of a single `claude_respond` tool with a `decision` field. Reduces tool count and naturally extends to plan reviews and question answers.
+
+5. **Separate resume/send_message tools**: Rejected in favor of a single `claude_send_message` that auto-resumes when needed. Simpler client experience -- clients don't need to track whether a session is active.
+
 ### Future Enhancements
 
-- **Persistent session index**: Store a session index file to survive MCP server restarts without the client needing to remember session IDs.
 - **Cost tracking**: Aggregate and report cost across sessions.
 - **Tool filtering UI**: Let MCP clients configure allowed/denied tools through a resource or prompt.
-- **Multiple working directories**: Support sessions that span multiple project directories.
 - **Session forking**: Use `--fork-session` to branch sessions for experimentation.
+- **MCP Resources**: Expose session output as MCP resources for richer client integration.
 
 ---
 
@@ -1082,15 +1231,13 @@ This project wraps Claude Code behind an OpenAI-compatible REST API using the Py
 
 3. **System prompt must be structured.** The SDK requires `{"type": "text", "text": "..."}` (or `{"type": "preset", "preset": "claude_code"}`), not plain strings. Verify whether the CLI's `--append-system-prompt` flag handles this automatically or if we need structured formatting.
 
-4. **Working directory isolation is critical.** Without an explicit working directory, Claude Code operates in the server's own directory and could read/modify the MCP server's source code. Every session must have an explicit `cwd` set.
+4. **`max_turns=1` when tools are disabled prevents wasted loops.** If a session is configured without tools, setting `--max-turns 1` avoids multi-turn reasoning loops where Claude tries to use tools that don't exist.
 
-5. **`max_turns=1` when tools are disabled prevents wasted loops.** If a session is configured without tools, setting `--max-turns 1` avoids multi-turn reasoning loops where Claude tries to use tools that don't exist.
+5. **Session management can be in-memory with TTL.** Their sessions use a 1-hour TTL with a background cleanup task every 5 minutes. Since Claude Code persists sessions to disk (`.claude/`), our in-memory session tracking can be lightweight -- we just need enough state to manage the process lifecycle. If a session expires from our tracker, the client can always resume it via `claude_send_message` with the session ID.
 
-6. **Session management can be in-memory with TTL.** Their sessions use a 1-hour TTL with a background cleanup task every 5 minutes. Since Claude Code persists sessions to disk (`.claude/`), our in-memory session tracking can be lightweight -- we just need enough state to manage the process lifecycle. If a session expires from our tracker, the client can always resume it via `claude_resume_session` with the session ID.
+6. **Token/cost estimation is approximate.** The SDK doesn't always provide exact token counts. When not available, they use a rough `len(text) / 4` heuristic. We should extract `cost_usd` from the `result` event when available but not depend on it.
 
-7. **Token/cost estimation is approximate.** The SDK doesn't always provide exact token counts. When not available, they use a rough `len(text) / 4` heuristic. We should extract `cost_usd` from the `result` event when available but not depend on it.
-
-8. **Factory pattern for mock/real implementations aids testing.** When `node-pty` is not available (e.g., in CI), they fall back to a mock implementation. We should use dependency injection for the process manager to enable the same pattern with our mock CLI.
+7. **Factory pattern for mock/real implementations aids testing.** When `node-pty` is not available (e.g., in CI), they fall back to a mock implementation. We should use dependency injection for the process manager to enable the same pattern with our mock CLI.
 
 ### From `jasonpaulso/claude-cli-lib` (TypeScript, node-pty)
 
@@ -1116,6 +1263,5 @@ This project is a generic PTY-based CLI process spawner. While it lacks Claude C
 | Use `--permission-prompt-tool`, not `bypassPermissions` | `openai-wrapper` shows bypass works but loses all safety |
 | Defensive stream parsing with graceful error handling | `openai-wrapper` encountered SDK format changes between versions |
 | In-memory sessions with TTL cleanup | `openai-wrapper` uses same pattern successfully |
-| Explicit working directory per session | `openai-wrapper` learned this the hard way (security issue) |
 | Ring buffer for event storage | Both projects use bounded output buffers |
 | Factory/DI pattern for testability | `claude-cli-lib` uses factory for mock/real implementations |
