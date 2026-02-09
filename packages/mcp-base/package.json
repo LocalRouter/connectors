@@ -1,7 +1,7 @@
 {
-  "name": "@localrouter/codex",
+  "name": "@localrouter/mcp-base",
   "version": "0.1.0",
-  "description": "MCP server wrapping Codex CLI as a set of MCP tools",
+  "description": "Shared base utilities for LocalRouter MCP connectors",
   "license": "AGPL-3.0",
   "type": "module",
   "main": "dist/index.js",
@@ -14,19 +14,17 @@
     "clean": "rm -rf dist *.tsbuildinfo",
     "lint": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "test:e2e": "CODEX_E2E=true vitest run test/e2e.test.ts"
+    "test:watch": "vitest"
   },
   "publishConfig": {
     "access": "public"
   },
   "dependencies": {
-    "@localrouter/mcp-base": "*",
-    "@modelcontextprotocol/sdk": "^1.26.0",
-    "zod": "^4.3.6"
+    "split2": "^4.2.0"
   },
   "devDependencies": {
     "@types/node": "^25.2.2",
+    "@types/split2": "^4.2.3",
     "vitest": "^4.0.18"
   }
 }

@@ -1,4 +1,4 @@
-import split2 from "split2";
+import { createNdjsonParser } from "@localrouter/mcp-base";
 import type { Transform } from "node:stream";
 import type { ParsedEvent } from "./types.js";
 
@@ -7,7 +7,7 @@ import type { ParsedEvent } from "./types.js";
  * Emits parsed objects. Malformed lines emit an 'error' event on the stream.
  */
 export function createStreamParser(): Transform {
-  return split2(JSON.parse);
+  return createNdjsonParser();
 }
 
 /**

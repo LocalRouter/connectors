@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { wrapToolHandler, log } from "@localrouter/mcp-base";
 import { SessionManager } from "./session-manager.js";
 import type { EnvConfig, PermissionMode } from "./types.js";
 
@@ -82,37 +83,31 @@ export function createMcpServer(envConfig: EnvConfig): {
           .describe("Skip all permission checks. Default: false"),
       },
     },
-    async (args) => {
-      try {
-        const result = await sessionManager.startSession({
-          prompt: args.prompt,
-          workingDirectory: args.workingDirectory,
-          model: args.model,
-          permissionMode: args.permissionMode as
-            | PermissionMode
-            | undefined,
-          allowedTools: args.allowedTools,
-          disallowedTools: args.disallowedTools,
-          maxTurns: args.maxTurns,
-          maxBudgetUsd: args.maxBudgetUsd,
-          systemPrompt: args.systemPrompt,
-          dangerouslySkipPermissions: args.dangerouslySkipPermissions,
-        });
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        };
-      } catch (err) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    },
+    wrapToolHandler(async (args: {
+      prompt: string;
+      workingDirectory?: string;
+      model?: string;
+      permissionMode?: string;
+      allowedTools?: string[];
+      disallowedTools?: string[];
+      maxTurns?: number;
+      maxBudgetUsd?: number;
+      systemPrompt?: string;
+      dangerouslySkipPermissions?: boolean;
+    }) => {
+      return sessionManager.startSession({
+        prompt: args.prompt,
+        workingDirectory: args.workingDirectory,
+        model: args.model,
+        permissionMode: args.permissionMode as PermissionMode | undefined,
+        allowedTools: args.allowedTools,
+        disallowedTools: args.disallowedTools,
+        maxTurns: args.maxTurns,
+        maxBudgetUsd: args.maxBudgetUsd,
+        systemPrompt: args.systemPrompt,
+        dangerouslySkipPermissions: args.dangerouslySkipPermissions,
+      });
+    }),
   );
 
   // ── 2. claude_say ──────────────────────────────────────────────────
@@ -132,30 +127,17 @@ export function createMcpServer(envConfig: EnvConfig): {
           ),
       },
     },
-    async (args) => {
-      try {
-        const result = await sessionManager.sayToSession({
-          sessionId: args.sessionId,
-          message: args.message,
-          permissionMode: args.permissionMode as
-            | PermissionMode
-            | undefined,
-        });
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        };
-      } catch (err) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    },
+    wrapToolHandler(async (args: {
+      sessionId: string;
+      message: string;
+      permissionMode?: string;
+    }) => {
+      return sessionManager.sayToSession({
+        sessionId: args.sessionId,
+        message: args.message,
+        permissionMode: args.permissionMode as PermissionMode | undefined,
+      });
+    }),
   );
 
   // ── 3. claude_status ───────────────────────────────────────────────
@@ -174,27 +156,12 @@ export function createMcpServer(envConfig: EnvConfig): {
           ),
       },
     },
-    async (args) => {
-      try {
-        const result = sessionManager.getSessionStatus(
-          args.sessionId,
-          args.outputLines,
-        );
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        };
-      } catch (err) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    },
+    wrapToolHandler((args: { sessionId: string; outputLines?: number }) => {
+      return sessionManager.getSessionStatus(
+        args.sessionId,
+        args.outputLines,
+      );
+    }),
   );
 
   // ── 4. claude_respond ──────────────────────────────────────────────
@@ -217,28 +184,13 @@ export function createMcpServer(envConfig: EnvConfig): {
           ),
       },
     },
-    async (args) => {
-      try {
-        const result = sessionManager.respondToQuestion({
-          sessionId: args.sessionId,
-          id: args.id,
-          answers: args.answers,
-        });
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        };
-      } catch (err) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    },
+    wrapToolHandler((args: { sessionId: string; id: string; answers: string[] }) => {
+      return sessionManager.respondToQuestion({
+        sessionId: args.sessionId,
+        id: args.id,
+        answers: args.answers,
+      });
+    }),
   );
 
   // ── 5. claude_interrupt ────────────────────────────────────────────
@@ -251,24 +203,9 @@ export function createMcpServer(envConfig: EnvConfig): {
         sessionId: z.string().describe("The session ID to interrupt"),
       },
     },
-    async (args) => {
-      try {
-        const result = sessionManager.interruptSession(args.sessionId);
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        };
-      } catch (err) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    },
+    wrapToolHandler((args: { sessionId: string }) => {
+      return sessionManager.interruptSession(args.sessionId);
+    }),
   );
 
   // ── 6. claude_list ─────────────────────────────────────────────────
@@ -292,27 +229,12 @@ export function createMcpServer(envConfig: EnvConfig): {
           ),
       },
     },
-    async (args) => {
-      try {
-        const result = sessionManager.listSessions({
-          workingDirectory: args.workingDirectory,
-          limit: args.limit,
-        });
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        };
-      } catch (err) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    },
+    wrapToolHandler((args: { workingDirectory?: string; limit?: number }) => {
+      return sessionManager.listSessions({
+        workingDirectory: args.workingDirectory,
+        limit: args.limit,
+      });
+    }),
   );
 
   return { mcpServer, sessionManager };
@@ -329,10 +251,10 @@ export async function startServer(envConfig: EnvConfig): Promise<void> {
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
 
-  log("info", "Claude Code MCP server started");
+  log("mcp-server", "info", "Claude Code MCP server started");
 
   const shutdown = async (): Promise<void> => {
-    log("info", "Shutting down...");
+    log("mcp-server", "info", "Shutting down...");
     await sessionManager.stop();
     await mcpServer.close();
     process.exit(0);
@@ -340,8 +262,4 @@ export async function startServer(envConfig: EnvConfig): Promise<void> {
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-}
-
-function log(level: string, message: string): void {
-  process.stderr.write(`[mcp-server] [${level}] ${message}\n`);
 }

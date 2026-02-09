@@ -21,6 +21,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@localrouter/mcp-base": "*",
     "@modelcontextprotocol/sdk": "^1.26.0",
     "split2": "^4.2.0",
     "zod": "^4.3.6"

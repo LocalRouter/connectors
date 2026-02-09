@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createStreamParser, parseEvent } from "./stream-parser.js";
+import { createNdjsonParser, log } from "@localrouter/mcp-base";
+import { parseEvent } from "./stream-parser.js";
 import type { SpawnConfig, ParsedEvent, EnvConfig } from "./types.js";
 
 /**
@@ -90,7 +91,7 @@ export function spawnClaudeProcess(
 
   // Parse NDJSON from stdout
   if (child.stdout) {
-    const parser = createStreamParser();
+    const parser = createNdjsonParser();
     child.stdout.pipe(parser);
 
     parser.on("data", (data: unknown) => {
@@ -99,14 +100,14 @@ export function spawnClaudeProcess(
     });
 
     parser.on("error", (err: Error) => {
-      log("warn", `Stream parse error: ${err.message}`);
+      log("process-manager", "warn", `Stream parse error: ${err.message}`);
     });
   }
 
   // Log stderr
   if (child.stderr) {
     child.stderr.on("data", (chunk: Buffer) => {
-      log("debug", `[claude stderr] ${chunk.toString().trim()}`);
+      log("process-manager", "debug", `[claude stderr] ${chunk.toString().trim()}`);
     });
   }
 
@@ -115,7 +116,7 @@ export function spawnClaudeProcess(
   });
 
   child.on("error", (err) => {
-    log("error", `Process error: ${err.message}`);
+    log("process-manager", "error", `Process error: ${err.message}`);
     onExit(1, null);
   });
 
@@ -143,8 +144,4 @@ export function sendMessage(child: ChildProcess, sessionId: string, message: str
  */
 export function interruptProcess(child: ChildProcess): void {
   child.kill("SIGINT");
-}
-
-function log(level: string, message: string): void {
-  process.stderr.write(`[process-manager] [${level}] ${message}\n`);
 }

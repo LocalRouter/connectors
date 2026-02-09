@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { pollUntil, waitForProcessExit, countActiveSessions } from "@localrouter/mcp-base";
 import {
   spawnClaudeProcess,
   sendMessage,
@@ -85,7 +86,7 @@ export class SessionManager {
     systemPrompt?: string;
     dangerouslySkipPermissions?: boolean;
   }): Promise<{ sessionId: string; status: SessionStatus }> {
-    if (this.getActiveSessionCount() >= this.envConfig.maxSessions) {
+    if (countActiveSessions(this.sessions) >= this.envConfig.maxSessions) {
       throw new Error(
         `Maximum concurrent sessions (${this.envConfig.maxSessions}) reached`,
       );
@@ -145,9 +146,9 @@ export class SessionManager {
     session.process = child;
 
     // Wait briefly for the init event to capture the real session ID
-    const realId = await this.waitForSessionId(session, 10000);
+    await pollUntil(() => !session.id.startsWith("temp_"), 10000);
 
-    return { sessionId: realId, status: "active" };
+    return { sessionId: session.id, status: "active" };
   }
 
   async sayToSession(params: {
@@ -170,7 +171,8 @@ export class SessionManager {
       if (needsModeChange) {
         // Interrupt current process, then resume with new mode
         interruptProcess(session.process);
-        await this.waitForExit(session, 5000);
+        await waitForProcessExit(session.process, 5000);
+        session.process = null;
         session.config.permissionMode = params.permissionMode;
         await this.resumeSession(session, params.message);
       } else {
@@ -506,7 +508,7 @@ export class SessionManager {
     session: Session,
     message: string,
   ): Promise<void> {
-    if (this.getActiveSessionCount() >= this.envConfig.maxSessions) {
+    if (countActiveSessions(this.sessions) >= this.envConfig.maxSessions) {
       throw new Error(
         `Maximum concurrent sessions (${this.envConfig.maxSessions}) reached`,
       );
@@ -552,66 +554,5 @@ export class SessionManager {
     };
     this.sessions.set(sessionId, session);
     return session;
-  }
-
-  private waitForSessionId(
-    session: Session,
-    timeoutMs: number,
-  ): Promise<string> {
-    return new Promise((resolve) => {
-      const startTime = Date.now();
-      const check = (): void => {
-        if (!session.id.startsWith("temp_")) {
-          resolve(session.id);
-          return;
-        }
-        if (Date.now() - startTime > timeoutMs) {
-          // Return temp ID on timeout
-          resolve(session.id);
-          return;
-        }
-        setTimeout(check, 50);
-      };
-      check();
-    });
-  }
-
-  private waitForExit(
-    session: Session,
-    timeoutMs: number,
-  ): Promise<void> {
-    return new Promise((resolve) => {
-      if (!session.process) {
-        resolve();
-        return;
-      }
-      const startTime = Date.now();
-      const check = (): void => {
-        if (!session.process) {
-          resolve();
-          return;
-        }
-        if (Date.now() - startTime > timeoutMs) {
-          try {
-            session.process.kill("SIGKILL");
-          } catch {
-            // ignore
-          }
-          session.process = null;
-          resolve();
-          return;
-        }
-        setTimeout(check, 50);
-      };
-      check();
-    });
-  }
-
-  private getActiveSessionCount(): number {
-    let count = 0;
-    for (const session of this.sessions.values()) {
-      if (session.process) count++;
-    }
-    return count;
   }
 }
